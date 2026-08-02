@@ -1,29 +1,29 @@
-# Revolut Merchant API — Payment Implementation Guide
+# Revolut Merchant API. Payment Implementation Guide
 
 **Author:** Prem Kumar
-**Scope:** Order creation → payment processing → refunds, with DB schema, webhooks, and security
-**API version referenced:** `2026-04-20` (Revolut Merchant API, header-versioned)
+**Scope:** Order creation, payment processing, refunds. Plus DB schema, webhooks, and security.
+**API version used:** `2026-04-20` (Revolut Merchant API, versioned through a header)
 
 ---
 
-## 1. How the whole thing fits together
+## 1. How the pieces fit together
 
-Revolut's Merchant API is built around one core object: the **Order**. You don't call a "charge card" endpoint directly like some older gateways — instead you create an Order, then a payment method (card field, Revolut Pay, Apple/Google Pay, hosted checkout) pays *into* that order. A refund is technically a second Order of `type: refund`, linked back to the original via `related_order_id`. Once you get used to this "everything is an order" model, the rest of the API is pretty consistent.
+Revolut's Merchant API is built around one main object: the **Order**. You don't call a "charge card" endpoint directly like some older gateways do. You create an Order first, then a payment method (card field, Revolut Pay, Apple/Google Pay, or the hosted checkout page) pays into that order. A refund is actually a second Order, with `type: refund`, linked back to the original order through `related_order_id`. Once that clicks, the rest of the API makes a lot more sense.
 
-Three layers in a production integration:
+There are three parts in a real integration:
 
-1. **Your backend** — creates orders, stores payment state, never touches raw card data.
-2. **Revolut's checkout surface** — either the hosted checkout page (redirect) or the embedded Merchant Web SDK (card field / widgets rendered in an iframe on your site). Either way, card data goes straight from the customer's browser to Revolut, never through your server.
-3. **Webhook listener** — the source of truth for order state changes, since payment confirmation is asynchronous (3DS challenges, bank processing delays, etc.).
+1. **Your backend.** Creates orders, stores payment state, never touches raw card data.
+2. **Revolut's checkout surface.** Either the hosted checkout page (you redirect the customer) or the embedded Merchant Web SDK (a card field rendered in an iframe on your own site). Either way, the card details go straight from the customer's browser to Revolut. Your server never sees them.
+3. **Webhook listener.** This is your real source of truth for order status, because payment confirmation is not instant. There's 3DS challenges, bank delays, and so on.
 
-Authentication is a static bearer token, no OAuth dance:
+Authentication is just a static bearer token. No OAuth flow needed:
 
 ```
 Authorization: Bearer sk_1234567890ABCdefGHIjklMNOpqrSTUvwxYZ...
 Revolut-Api-Version: 2026-04-20
 ```
 
-The secret key lives only on your server. There's a separate public key that goes to the frontend for initializing the Merchant Web SDK. Every request that touches money must also carry the `Revolut-Api-Version` header — if you omit it, the request is rejected outright. I'm pinning `2026-04-20` for this implementation since it's the latest stable version as of writing.
+The secret key stays on your server only. There's a separate public key for the frontend, used to set up the Merchant Web SDK. Every money related request also needs the `Revolut-Api-Version` header. Skip it and the request just gets rejected. I've pinned `2026-04-20` here since it's the latest stable version at the time of writing.
 
 ---
 
@@ -31,9 +31,9 @@ The secret key lives only on your server. There's a separate public key that goe
 
 **Endpoint:** `POST /api/orders`
 
-This is always a server-to-server call. It must never be initiated from the frontend because it requires the secret key.
+This always has to be a server to server call. It should never be triggered from the frontend, because it needs the secret key.
 
-### Request (minimum viable + the fields I'd actually use)
+### Request (the fields I'd actually send)
 
 ```json
 {
@@ -62,15 +62,15 @@ This is always a server-to-server call. It must never be initiated from the fron
 }
 ```
 
-Notes that actually matter in practice:
+Some things worth calling out here:
 
-- **`amount` is always in minor units.** 4999 in GBP is £49.99. This trips people up constantly, especially with currencies like JPY or ISK where there's no minor unit at all (100 = 100 units, not 1.00). Always look up the currency's exponent before hardcoding cent math.
-- **`line_items` total must exactly equal `amount`.** If you're doing tax/discount math, the sum of `total_amount` across line items has to match the order total or the request 400s.
-- **`capture_mode: automatic` vs `manual`** is the single most important architectural decision here. Automatic captures funds the moment authorization succeeds — good for digital goods, bad for anything with a fulfillment delay (you'd be holding customer money before you've shipped). Manual capture authorizes and holds the funds, and you capture explicitly later (see §4). For e-commerce with physical shipping, I'd default to manual and capture on dispatch.
-- **`merchant_order_data.reference`** is your own internal order ID. Always set this — it's what you match against in webhooks and reconciliation, since Revolut's order `id` is meaningless to your existing systems.
-- **`expire_pending_after`** auto-fails abandoned orders (someone opens checkout, never pays, tab sits open forever). Without this, pending orders can sit indefinitely.
+- **`amount` is always in minor units.** 4999 in GBP means £49.99. This catches people out constantly, especially with currencies like JPY or ISK that don't really have a minor unit at all (100 there just means 100 units, not 1.00). Check the currency's exponent before you hardcode any cent math.
+- **`line_items` need to add up to `amount` exactly.** If you're doing tax or discount calculations, the sum of every line item's `total_amount` must match the order total, or the request just fails with a 400.
+- **`capture_mode: automatic` vs `manual` is the biggest decision here.** Automatic capture takes the funds the second authorization succeeds. That's fine for digital goods, but risky for anything with a shipping delay, since you'd be holding the customer's money before you've actually sent anything. Manual capture authorizes and holds the funds, and you capture them yourself later (covered in section 4). For a store shipping physical items, I'd go with manual capture as the default.
+- **`merchant_order_data.reference` is your own internal order ID.** Always set this. It's what you match against later when webhooks come in, since Revolut's order `id` means nothing to your existing systems.
+- **`expire_pending_after` auto fails abandoned orders.** Without it, an order can sit in `pending` forever if someone opens checkout and just closes the tab.
 
-### Response — the fields that matter for what comes next
+### Response, and which fields you actually need next
 
 ```json
 {
@@ -85,52 +85,52 @@ Notes that actually matter in practice:
 }
 ```
 
-- **`id`** — the permanent order ID. Store this. Every subsequent operation (capture, cancel, refund, retrieve) uses this ID.
-- **`token`** — a *temporary* ID, valid only until the payment is authorized. This is what you hand to the frontend Merchant Web SDK when embedding checkout directly on your site instead of redirecting to `checkout_url`. Because it expires after authorization, never persist it as a long-term reference — use `id` for that.
-- **`checkout_url`** — if you're using the hosted checkout page approach (redirect flow, least frontend work), this is the URL you redirect the customer to.
-- **`state: pending`** — order created, no payment attempt yet. This is the state you write to your `orders` table immediately after this response returns.
+- **`id`.** The permanent order ID. Store this. Every operation after this point (capture, cancel, refund, retrieve) uses this ID.
+- **`token`.** A temporary ID that expires once the payment gets authorized. This is what you'd hand to the frontend Merchant Web SDK if you're embedding checkout on your own site instead of redirecting. Since it expires, don't use it as a long term reference. Use `id` for that.
+- **`checkout_url`.** If you're using the hosted checkout page (the redirect approach, which needs the least frontend work), this is the link you send the customer to.
+- **`state: pending`.** Order created, no payment attempt yet. Write this to your `orders` table as soon as the response comes back.
 
-At this point your backend has one job left in the synchronous flow: save the order row and redirect the customer (or hand `token` to the embedded widget). Everything after this is async and driven by webhooks.
+After this, your backend's synchronous job is basically done. Save the order row, redirect the customer (or hand `token` to the embedded widget), and let webhooks handle the rest.
 
 ---
 
-## 3. Payment processing (what happens between order creation and completion)
+## 3. Payment processing (between order creation and completion)
 
-The customer pays via whichever method you've enabled — card, Apple Pay, Google Pay, Revolut Pay, or Pay by Bank. Regardless of method, the order moves through this lifecycle:
+The customer pays through whichever method you've enabled, card, Apple Pay, Google Pay, Revolut Pay, or Pay by Bank. No matter which one, the order moves through roughly this lifecycle:
 
 ```
-pending → processing → authorised → completed
-                    ↘ failed
-authorised → (manual capture) → completed
-authorised → (cancel) → cancelled
+pending -> processing -> authorised -> completed
+                     \-> failed
+authorised -> (manual capture) -> completed
+authorised -> (cancel) -> cancelled
 ```
 
 | State | Meaning |
 |---|---|
 | `pending` | Order created, no successful payment attempt yet |
-| `processing` | Payment submitted, being verified/authorized |
-| `authorised` | Funds reserved on the card, not yet captured (manual capture mode only) |
+| `processing` | Payment submitted, being verified or authorized |
+| `authorised` | Funds reserved on the card, not captured yet (manual capture only) |
 | `completed` | Funds captured and settling to your account |
 | `cancelled` | Order or authorization cancelled before capture |
-| `failed` | Payment declined or order expired |
+| `failed` | Payment declined, or the order expired |
 
-Each order also carries a `payments` array — a single order can have multiple payment *attempts* (e.g., customer's first card declines, they retry with a different card). Each payment object has its own `state` (much more granular — `authentication_challenge`, `authorisation_passed`, `declined`, etc.) plus a `decline_reason` when applicable (`insufficient_funds`, `invalid_cvv`, `do_not_honour`, and so on — there's a fixed enum of about 25 reasons).
+Each order also has a `payments` array. A single order can have more than one payment attempt (say the customer's first card fails and they retry with another one). Each payment object has its own, more detailed state (`authentication_challenge`, `authorisation_passed`, `declined`, and others), plus a `decline_reason` when it fails. There's a fixed list of about 25 decline reasons, things like `insufficient_funds`, `invalid_cvv`, `do_not_honour`.
 
 ### 3DS handling
 
-If a payment's state is `authentication_challenge`, the response includes an `authentication_challenge` object with an `acs_url` — this is the bank's 3D Secure challenge page. If you're using the embedded Merchant Web SDK, it handles the redirect/iframe for this automatically. If you built your own custom flow against the raw API, you're responsible for redirecting the customer to `acs_url` and handling the return.
+If a payment's state is `authentication_challenge`, the response includes an `authentication_challenge` object with an `acs_url`. That's the bank's 3D Secure challenge page. If you're using the embedded Merchant Web SDK, it handles this redirect for you automatically. If you're calling the raw API yourself, you're the one responsible for sending the customer to `acs_url` and handling the return.
 
-### What you actually need to store from a payment object
+### What's actually worth storing from a payment object
 
-From the `payments[]` array once a payment settles, the fields worth persisting:
+Once a payment settles, from the `payments[]` array, I'd persist:
 
-- `id` — payment ID (distinct from order ID)
-- `state`, `decline_reason`, `bank_message` — for support/dispute purposes
-- `payment_method.type` — card / apple_pay / google_pay / revolut_pay_card / revolut_pay_account / sepa_direct_debit
-- `payment_method.card_last_four`, `card_brand`, `card_expiry` — display-safe card info, never the PAN
-- `payment_method.fingerprint` — a stable 44-char hash identifying the payment instrument across transactions, useful for fraud/dedup logic (e.g., blocking a card associated with chargebacks) without storing the actual card number
-- `authorisation_code` — issuer's approval code, needed if you ever have to manually reference a transaction with the bank
-- `network_transaction_id` — needed for linking recurring/retry attempts to the original authorization
+- `id`, the payment ID (different from the order ID)
+- `state`, `decline_reason`, `bank_message`, useful for support and disputes later
+- `payment_method.type`, card, apple_pay, google_pay, revolut_pay_card, revolut_pay_account, or sepa_direct_debit
+- `payment_method.card_last_four`, `card_brand`, `card_expiry`, display safe card info, never the full card number
+- `payment_method.fingerprint`, a stable 44 character hash that identifies the payment instrument across transactions. Useful for fraud checks (blocking a card tied to past chargebacks) without ever storing the actual card number
+- `authorisation_code`, the issuer's approval code, needed if you ever have to manually reference a transaction with the bank
+- `network_transaction_id`, needed if you're linking retry or recurring attempts back to the original authorization
 
 ---
 
@@ -138,9 +138,9 @@ From the `payments[]` array once a payment settles, the fields worth persisting:
 
 **Endpoint:** `POST /api/orders/{order_id}/capture`
 
-If you set `capture_mode: manual` at creation, the order sits in `authorised` state holding funds until you explicitly capture. This is idempotent — calling capture twice with the same amount just returns the current state instead of double-charging, but calling it twice with *different* amounts errors out. Good practice: fire capture the moment your fulfillment pipeline confirms the order is going out (e.g., from your shipping/inventory service), not before.
+If `capture_mode` was set to `manual` at creation, the order sits in `authorised` state, holding the funds, until you call capture yourself. This call is idempotent. Calling it twice with the same amount just returns the current state instead of charging twice, but calling it twice with different amounts will error out. Good practice is to fire capture the moment your fulfillment pipeline confirms the order is actually going out, not before.
 
-There's also a hard deadline: `capture_deadline` on the payment object tells you when the issuer will auto-release the hold if you never capture. Don't sit on authorized-but-uncaptured orders indefinitely.
+There's also a hard deadline here. The payment object has a `capture_deadline` field telling you when the issuer will release the hold automatically if you never capture. Don't leave authorized but uncaptured orders sitting around indefinitely.
 
 ---
 
@@ -159,40 +159,40 @@ There's also a hard deadline: `capture_deadline` on the payment object tells you
 }
 ```
 
-Key mechanics:
+A few things to know about how this actually behaves:
 
-- Refunds only work on orders in `completed` state. You cannot refund a pending or authorized-but-uncaptured order — for that you'd cancel instead.
-- `currency` must match the original order's currency exactly.
-- Partial refunds are supported, and you can issue multiple partial refunds against one order as long as the cumulative total doesn't exceed the original `amount`. This means your DB schema needs to support many-refunds-per-order, not a single refund flag.
-- The response is itself a new Order object, `type: refund`, with `related_order_id` pointing back to the original. Same lifecycle states apply (`pending` → `completed`) — refunds aren't instant either, they go through processing.
-- **Always send an `Idempotency-Key` header on refund requests.** If your request times out and you retry, without an idempotency key you risk double-refunding. Use something derived from your internal refund record ID.
+- Refunds only work on orders in `completed` state. You can't refund a pending order, or one that's authorized but not yet captured. For those you'd cancel instead.
+- `currency` has to match the original order's currency exactly.
+- Partial refunds are allowed, and you can issue more than one against the same order as long as the total doesn't go over the original `amount`. That means your database needs to support several refunds per order, not just a single refund flag.
+- The response is itself a new Order, with `type: refund`, and `related_order_id` pointing back to the original. It goes through the same lifecycle states (`pending` to `completed`) too. Refunds aren't instant either.
+- **Always send an `Idempotency-Key` header on refund requests.** If a request times out and you retry it blindly, without an idempotency key you risk refunding the customer twice.
 
 ```
 Idempotency-Key: refund-req-a3f9c2e1
 ```
 
-I'd generate this key deterministically from your own refund record's primary key (or a UUID stored *before* the request fires) so retries — even across server restarts — reuse the same key.
+I'd generate this key from your own refund record's primary key (or a UUID you save before firing the request), so retries reuse the same key even if your server restarts in between.
 
 ---
 
 ## 6. Webhooks
 
-Polling order status is a bad idea at any scale — webhooks are the intended source of truth for state transitions.
+Polling for order status is a bad idea once you have any real volume. Webhooks are meant to be the source of truth for state changes.
 
-**Setup:** `POST /api/webhooks` with a URL and list of subscribed events (at minimum `ORDER_COMPLETED` and `ORDER_AUTHORISED`; also worth adding refund and dispute events if you support those flows). Revolut returns a `signing_secret` on creation — store this securely, it's what you use to verify incoming payloads are actually from Revolut and not spoofed.
+**Setup:** `POST /api/webhooks` with a URL and the list of events you want (at minimum `ORDER_COMPLETED` and `ORDER_AUTHORISED`, plus refund and dispute events if you support those). Revolut gives you back a `signing_secret` on creation. Store this somewhere safe, it's what lets you check that an incoming payload is really from Revolut and not something faked.
 
-**Important gotcha:** delivery order isn't guaranteed. For a normal completed payment, you'd expect `ORDER_AUTHORISED` then `ORDER_COMPLETED`, but if the first delivery attempt fails and gets requeued, you might receive `ORDER_COMPLETED` before `ORDER_AUTHORISED`. Your handler needs to be idempotent and state-driven (i.e., "set order to X" not "assume this is the Nth event"), never assume ordering.
+**One thing to watch for:** delivery order isn't guaranteed. For a normal successful payment you'd expect `ORDER_AUTHORISED` before `ORDER_COMPLETED`, but if the first delivery attempt fails and gets retried, you might get `ORDER_COMPLETED` first. Your handler has to be idempotent and driven by state, not by assuming a particular order of events.
 
-### Signature verification (this is the part people skip and regret)
+### Verifying the signature (the part people skip, and then regret)
 
-Every webhook POST includes a `Revolut-Signature` header and a `Revolut-Request-Timestamp` header. You reconstruct the signed payload and compare HMACs:
+Every webhook POST comes with a `Revolut-Signature` header and a `Revolut-Request-Timestamp` header. You rebuild the signed payload and compare HMACs:
 
 ```
 payload_to_sign = "v1." + timestamp + "." + raw_request_body
 expected_signature = "v1=" + HMAC_SHA256(signing_secret, payload_to_sign)
 ```
 
-Node/Express implementation:
+Here's a Node/Express implementation:
 
 ```javascript
 const crypto = require('crypto');
@@ -208,7 +208,7 @@ function verifyRevolutWebhook(req, signingSecret) {
     .update(payloadToSign)
     .digest('hex');
 
-  // timing-safe comparison to avoid timing attacks
+  // timing safe comparison, avoids timing attacks
   return crypto.timingSafeEqual(
     Buffer.from(expectedSignature),
     Buffer.from(receivedSignature)
@@ -218,25 +218,25 @@ function verifyRevolutWebhook(req, signingSecret) {
 
 Two things that will bite you if you're not careful:
 
-1. **You need the raw request body, not the parsed JSON.** If you're using `express.json()` globally, by the time your handler runs the body's already been parsed and re-serializing it won't byte-for-byte match what was signed (key ordering, whitespace). Use a raw body middleware scoped just to the webhook route.
-2. **Reject anything older than a few minutes** based on the timestamp header, to guard against replay attacks even with a valid signature.
+1. **You need the raw body, not the parsed JSON.** If `express.json()` is running globally before your handler, the body's already parsed by the time you see it, and re-serializing it won't match byte for byte what Revolut actually signed (key order, whitespace, all of it). Use raw body middleware scoped just to the webhook route.
+2. **Reject anything with an old timestamp**, a few minutes at most, so a valid signature from a captured request can't be replayed later.
 
-Also reject on signature mismatch with a 401 — don't process the event, don't 200 it, don't log-and-continue.
+If the signature doesn't match, reject with a 401. Don't process the event, don't return 200, don't log it and move on anyway.
 
 ---
 
-## 7. PCI-compliant database schema
+## 7. PCI compliant database schema
 
-The single most important design decision: **your database should never contain a full card number, CVV, or any raw payment credential.** Revolut's checkout surface (hosted page or embedded widget) handles all of that — card data never transits your server, which is what keeps you at PCI DSS SAQ A (the lightest self-assessment tier) instead of SAQ D. The schema below only stores *references and display-safe metadata*.
+The single biggest decision here: **your database should never hold a full card number, CVV, or any raw payment credential.** Revolut's checkout surface, hosted page or embedded widget, handles all of that for you. Card data never touches your server, which is what keeps you in the lightest PCI DSS tier (SAQ A) instead of the heaviest one (SAQ D). Everything below only stores references and display safe metadata.
 
 ```sql
--- Orders: mirrors Revolut's order lifecycle, keyed by our own PK + their ID
+-- Orders: mirrors Revolut's order lifecycle, keyed by our own PK plus their ID
 CREATE TABLE orders (
     id                  BIGSERIAL PRIMARY KEY,
     reference           VARCHAR(64) UNIQUE NOT NULL,      -- our internal order ref, e.g. ORD-10234
     revolut_order_id    UUID UNIQUE NOT NULL,              -- Revolut's `id`
     customer_id         BIGINT NOT NULL REFERENCES customers(id),
-    amount_minor        BIGINT NOT NULL,                   -- always minor units, never float
+    amount_minor        BIGINT NOT NULL,                   -- always minor units, never a float
     currency            CHAR(3) NOT NULL,
     state               VARCHAR(20) NOT NULL,               -- pending/processing/authorised/completed/cancelled/failed
     capture_mode        VARCHAR(10) NOT NULL DEFAULT 'automatic',
@@ -261,10 +261,10 @@ CREATE TABLE payments (
     amount_minor          BIGINT NOT NULL,
     currency               CHAR(3) NOT NULL,
     payment_method_type    VARCHAR(30),        -- card / apple_pay / google_pay / revolut_pay_card / etc.
-    card_brand              VARCHAR(20),        -- visa/mastercard/amex — display only
+    card_brand              VARCHAR(20),        -- visa/mastercard/amex, display only
     card_last_four            CHAR(4),
     card_expiry                CHAR(5),          -- MM/YY, display only
-    payment_fingerprint          CHAR(44),       -- for fraud/dedup logic, not reversible to PAN
+    payment_fingerprint          CHAR(44),       -- for fraud/dedup logic, not reversible to a card number
     authorisation_code            VARCHAR(10),
     network_transaction_id         VARCHAR(64),
     created_at                      TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -274,7 +274,7 @@ CREATE TABLE payments (
 CREATE INDEX idx_payments_order_id ON payments(order_id);
 CREATE INDEX idx_payments_fingerprint ON payments(payment_fingerprint);
 
--- Refunds: separate table, not a flag on orders, since multiple partials are allowed
+-- Refunds: kept as its own table, not a flag on orders, since partial refunds can stack
 CREATE TABLE refunds (
     id                   BIGSERIAL PRIMARY KEY,
     original_order_id    BIGINT NOT NULL REFERENCES orders(id),
@@ -289,10 +289,10 @@ CREATE TABLE refunds (
 
 CREATE INDEX idx_refunds_original_order ON refunds(original_order_id);
 
--- Webhook event log: for replay protection, debugging, and audit trail
+-- Webhook event log: replay protection, debugging, and an audit trail
 CREATE TABLE webhook_events (
     id                BIGSERIAL PRIMARY KEY,
-    revolut_event_id  VARCHAR(64),           -- dedupe key if Revolut provides one, else hash of payload+timestamp
+    revolut_event_id  VARCHAR(64),           -- dedupe key if Revolut provides one, else hash of payload + timestamp
     event_type         VARCHAR(50) NOT NULL,   -- ORDER_COMPLETED, ORDER_AUTHORISED, etc.
     order_id             BIGINT REFERENCES orders(id),
     raw_payload            JSONB NOT NULL,
@@ -306,57 +306,57 @@ CREATE INDEX idx_webhook_events_order_id ON webhook_events(order_id);
 CREATE UNIQUE INDEX idx_webhook_events_dedupe ON webhook_events(revolut_event_id) WHERE revolut_event_id IS NOT NULL;
 ```
 
-Design decisions worth explaining if asked in interview:
+A few design choices worth being able to explain out loud:
 
-- **No card number, no CVV, anywhere.** Only `card_last_four`, `card_brand`, `card_expiry` — all display-safe fields that come straight back from Revolut's API response, never captured by our own forms.
-- **`payment_fingerprint`** lets us do fraud detection (block a card that charged back before) without ever holding the reversible card number.
-- **Amounts are always `BIGINT` in minor units**, never `FLOAT`/`DECIMAL` derived from float math. Floating point + money is a classic bug source.
-- **`webhook_events` is an append-only audit log**, separate from the order state itself. This means if a webhook handler crashes mid-processing, we can replay from this table, and it also gives us a forensic trail for support disputes ("customer says they paid, we say we didn't get confirmation — check the log").
-- **`idempotency_key` on refunds is UNIQUE**, enforced at the DB layer, not just as an API header — belt and suspenders against double-refunding from a retried request.
+- **No card number, no CVV, anywhere in the schema.** Only `card_last_four`, `card_brand`, `card_expiry`, all display safe fields that come straight back from Revolut's own API response. We never capture card data through our own forms in the first place.
+- **`payment_fingerprint` lets us do fraud checks** (block a card that charged back before) without ever holding a reversible card number.
+- **Amounts are always `BIGINT` in minor units**, never `FLOAT` or anything derived from float math. Mixing floats with money is a classic way to get rounding bugs.
+- **`webhook_events` is append only**, kept separate from the order state itself. If a webhook handler crashes halfway through processing, we can replay from this table. It also gives us a paper trail for support disputes, like when a customer says they paid and we need to check whether we actually got confirmation.
+- **`idempotency_key` on refunds is unique at the database level**, not just passed as an API header. That way even a bug in the retry logic can't slip through and double refund someone.
 
 ---
 
 ## 8. Error handling
 
-A few categories to handle distinctly:
+A few categories worth treating differently:
 
-**Validation errors (400)** — malformed request, e.g. line items not summing to order amount, missing required address fields for airline/marketplace industry data. Caught before the request even reaches the payment network; fix and retry.
+**Validation errors (400).** Malformed request, like line items that don't sum to the order amount, or missing address fields required for certain industries. These get caught before the request ever reaches a payment network. Fix the request and retry.
 
-**Authentication errors (401)** — bad or expired secret key. Should never happen in production unless a key was rotated and the deploy didn't pick it up; alert loudly if this occurs.
+**Authentication errors (401).** Bad or expired secret key. This shouldn't happen in production unless a key got rotated and the deploy didn't pick up the new one. Worth alerting loudly on if it ever shows up.
 
-**Payment declines** — not an API error at all; the request succeeds (201), but the *payment* inside the order has `state: declined` or `failed` with a `decline_reason`. Map these to customer-facing messages instead of showing raw enum values — `insufficient_funds` and `invalid_cvv` need very different UI copy than `suspected_fraud` (where you probably don't want to tell the customer exactly why, for security reasons).
+**Payment declines.** Not really an API error at all. The request itself succeeds (201), but the payment inside that order comes back with `state: declined` or `failed`, along with a `decline_reason`. Map these to customer facing messages instead of showing the raw enum. `insufficient_funds` and `invalid_cvv` need very different copy than `suspected_fraud`, where you probably don't want to tell the customer the exact reason, for security purposes.
 
-**Network/timeout errors on your side** — always retry idempotent GETs freely. For POSTs that create money movement (create order, refund), only retry with an `Idempotency-Key` — otherwise a timeout followed by a blind retry can double-charge or double-refund.
+**Network or timeout errors on your side.** Retry idempotent GET requests freely. For POSTs that move money (creating an order, issuing a refund), only retry with an `Idempotency-Key` attached. A timeout followed by a blind retry can otherwise double charge or double refund someone.
 
-**Webhook delivery failures** — Revolut retries failed webhook deliveries automatically on their side, but your endpoint should also be defensive: return 200 only after you've durably persisted the event (write to `webhook_events` first, ack second, process asynchronously if the business logic is heavy). If your endpoint 500s, treat that as expected — the retry will come.
-
----
-
-## 9. Security best practices (beyond PCI scope avoidance)
-
-- **Secret key**: environment variable / secrets manager, never in source control, never in frontend bundles. Rotate on any suspected leak.
-- **Webhook signature verification is mandatory**, not optional — an unauthenticated webhook endpoint is an open door to fake "payment completed" events that could trigger free fulfillment.
-- **TLS everywhere**, obviously, including the webhook receiver endpoint (Revolut requires HTTPS for webhook URLs).
-- **Rate-limit and validate webhook payload size** before parsing, standard hardening against malformed/oversized payloads.
-- **Idempotency keys on all money-moving mutations** (orders, refunds), generated once per logical operation and reused across retries.
-- **Least-privilege on the DB**: the service account writing `payments`/`refunds` shouldn't have blanket table access if you're running this in a larger system with other services touching the same database.
-- **Log payment metadata, never payment credentials** — even in error logs / stack traces, make sure card data (which you never have) and full webhook payloads with sensitive customer PII are handled per your data retention policy, not dumped into plaintext logs indefinitely.
+**Webhook delivery failures.** Revolut retries failed deliveries on their own side, but your endpoint should still be defensive. Return 200 only once you've durably saved the event (write to `webhook_events` first, acknowledge second, and process the business logic asynchronously if it's heavy). If your endpoint returns a 500, that's fine, treat it as expected, the retry will come.
 
 ---
 
-## 10. Assumptions made in this implementation
+## 9. Security practices beyond just PCI scope
 
-- Assumed **hosted checkout page (redirect) flow** as the primary integration path rather than fully embedding the Merchant Web SDK card field, since it requires the least custom frontend PCI-sensitive code — worth calling out explicitly if the assessment expected the embedded widget approach instead.
-- Assumed **manual capture mode** for the reference implementation, on the basis that most e-commerce with physical fulfillment shouldn't capture funds before shipment; automatic capture is a one-line config change if the business model is digital goods instead.
-- Assumed **GBP** as the reference currency in examples; currency handling (minor unit conversion) generalizes to any ISO 4217 currency Revolut supports.
-- Assumed a **single Postgres database** for the schema; in a real production system, `webhook_events` might reasonably live in a separate append-only store depending on volume.
-- Did not implement **subscriptions, payouts, or disputes** endpoints, since the brief scoped this to order creation, payment processing, and refunds specifically.
+- **Secret key** goes in an environment variable or secrets manager, never in source control, never in a frontend bundle. Rotate it if you ever suspect a leak.
+- **Webhook signature verification is not optional.** An unauthenticated webhook endpoint is basically an open door for someone to fake a "payment completed" event and trigger free fulfillment.
+- **TLS everywhere**, including the webhook receiver (Revolut requires HTTPS for webhook URLs anyway).
+- **Rate limit and check payload size** on the webhook endpoint before you even parse it, standard hardening against malformed or oversized requests.
+- **Idempotency keys on every money moving request** (orders, refunds), generated once per operation and reused on retries.
+- **Least privilege on the database.** If this is part of a bigger system, the service writing to `payments` and `refunds` shouldn't have blanket access to every table.
+- **Log payment metadata, never payment credentials.** Even in error logs and stack traces, make sure full webhook payloads and customer PII are handled according to your data retention policy, not dumped into plaintext logs forever.
+
+---
+
+## 10. Assumptions I made
+
+- Went with the **hosted checkout page (redirect) flow** as the main approach here, rather than the fully embedded Merchant Web SDK card field, since it needs the least custom PCI sensitive frontend code. Worth mentioning if the assessment actually expected the embedded widget instead.
+- Went with **manual capture mode** for this write up, on the reasoning that most stores shipping physical goods shouldn't take the customer's money before the order actually ships. Switching to automatic capture is a one line config change if the business is selling digital goods instead.
+- Used **GBP** in the examples. The minor unit handling generalizes to any ISO 4217 currency Revolut supports.
+- Assumed a **single Postgres database** for the schema. In a bigger production system, `webhook_events` might reasonably sit in its own append only store depending on volume.
+- Didn't cover **subscriptions, payouts, or disputes**, since the brief scoped this to order creation, payment processing, and refunds.
 
 ---
 
 ## References
 
-- [Revolut Merchant API — Orders](https://developer.revolut.com/docs/merchant/orders)
+- [Revolut Merchant API, Orders](https://developer.revolut.com/docs/merchant/orders)
 - [Create an order](https://developer.revolut.com/docs/merchant/create-order)
 - [Refund an order](https://developer.revolut.com/docs/merchant/refund-order)
 - [Webhooks](https://developer.revolut.com/docs/merchant/webhooks)
